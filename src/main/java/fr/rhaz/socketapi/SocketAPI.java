@@ -1,13 +1,15 @@
 package fr.rhaz.socketapi;
 
 import java.io.BufferedReader;
+import java.io.ByteArrayOutputStream;
+import java.io.ByteArrayInputStream;
 import java.io.IOException;
+import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.io.PrintWriter;
 import java.net.ServerSocket;
 import java.net.Socket;
 import java.security.GeneralSecurityException;
-import java.security.InvalidKeyException;
 import java.security.KeyFactory;
 import java.security.KeyPair;
 import java.security.KeyPairGenerator;
@@ -18,39 +20,36 @@ import java.security.spec.PKCS8EncodedKeySpec;
 import java.security.spec.X509EncodedKeySpec;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Base64;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.concurrent.atomic.AtomicBoolean;
 
-import javax.crypto.BadPaddingException;
 import javax.crypto.Cipher;
-import javax.crypto.IllegalBlockSizeException;
-import javax.crypto.NoSuchPaddingException;
+import javax.crypto.KeyGenerator;
 import javax.crypto.SecretKey;
-import javax.crypto.SecretKeyFactory;
-import javax.crypto.spec.DESedeKeySpec;
-import javax.xml.bind.DatatypeConverter;
-
-import sun.misc.BASE64Decoder;
-import sun.misc.BASE64Encoder;
-
+import javax.crypto.spec.SecretKeySpec;
 import com.google.gson.Gson;
 import com.google.gson.JsonSyntaxException;
 
 public class SocketAPI {
 	public static Gson gson = new Gson();
 	
+	public static class Logger extends ByteArrayOutputStream{
+		public PrintWriter writer = new PrintWriter(System.out);
+		
+		public InputStream getInputStream(){
+			return new ByteArrayInputStream(this.buf, 0, this.count);
+		}
+	}
+	
 	public static Gson gson(){
 		return gson;
 	}
 	
-	public static interface SocketLogger{
-		public void info(String str);
-		public void warning(String str);
-	}
-	
 	public static class Server{
 		public static interface SocketServerApp{
+			public void log(String err);
 			public void onConnect(SocketMessenger mess);
 			public void onHandshake(SocketMessenger mess, String name);
 			public void onJSON(SocketMessenger mess, Map<String, String> map);
@@ -60,25 +59,37 @@ public class SocketAPI {
 		}
 		
 		public static class SocketServer implements Runnable {
-			private ServerSocket server;
-			private int port;
-			public KeyPair keys;
-			private SocketServerApp app;
-			private ArrayList<SocketMessenger> messengers;
+			private Data Data = new Data();
 			
-			public SocketServer(SocketServerApp app, int port, KeyPair keys){
-				this.keys = keys;
-				this.port = port;
-				this.app = app;
-				messengers = new ArrayList<>();
-				try { server = new ServerSocket();
-				} catch (IOException e) {}
+			public class Data{
+				private int port;
+				private SocketServerApp app;
+				private ServerSocket server;
+				private int security;
+				private ArrayList<SocketMessenger> messengers;
+				private String name;
+				
+				public void set(String name, int port, SocketServerApp app, int security) throws IOException{
+					Data.name = name;
+					Data.port = port;
+					Data.app = app;
+					Data.security = security;
+					Data.server = new ServerSocket();
+					Data.messengers = new ArrayList<>();
+				}
+			}
+			
+			public SocketServer(String name, SocketServerApp app, int port, int security){
+				try {
+					Data.set(name, port, app, security);
+				} catch (IOException e) {
+				}
 		    }
 			
 			public IOException start(){
 				try {
-					server = new ServerSocket(port);
-					app.run(this);
+					Data.server = new ServerSocket(Data.port);
+					Data.app.run(this);
 					return null;
 				} catch (IOException e) {
 					return e;
@@ -86,40 +97,38 @@ public class SocketAPI {
 			}
 			
 			public int getPort(){
-				return port;
+				return Data.port;
 			}
 			
 			public SocketServerApp getApp(){
-				return app;
-			}
-
-			public KeyPair getKeys(){
-				return keys;
+				return Data.app;
 			}
 			
 			public ServerSocket getServerSocket(){
-				return server;
+				return Data.server;
 			}
 			
 			@Override
 		    public void run(){
-				while(!server.isClosed()){
+				while(!Data.server.isClosed()){
 					try {
-						Socket socket = server.accept();
-						socket.setTcpNoDelay(true);
-						SocketMessenger messenger = new SocketMessenger(this, socket);
-						messengers.add(messenger);
-						app.onConnect(messenger);
-						app.run(messenger);
-					} catch (IOException e) {}
+						Socket socket = Data.server.accept(); // Accept new connection
+						socket.setTcpNoDelay(true); // Set socket option
+						
+						SocketMessenger messenger = new SocketMessenger(this, socket, Data.security); // Create a new messenger for this socket
+						Data.messengers.add(messenger); // Add this messenger to the list
+						Data.app.onConnect(messenger); // Trigger onConnect event
+						Data.app.run(messenger); // Run the messenger
+					} catch (IOException e) {
+					}
 				} 
 		    }
 		    
 			public IOException close(){
-				if(!server.isClosed()){
+				if(!Data.server.isClosed()){
 					try {
-						server.close();
-						for(SocketMessenger messenger:new ArrayList<>(messengers)) messenger.close();
+						Data.server.close(); // Close the server
+						for(SocketMessenger messenger:new ArrayList<>(Data.messengers)) messenger.close(); // Close the messengers
 					} catch (IOException e) {
 						return e;
 					}
@@ -127,84 +136,153 @@ public class SocketAPI {
 			}
 		    
 		    public boolean isEnabled(){
-		    	return !server.isClosed();
+		    	return !Data.server.isClosed();
 		    }
 		}
 		
 		public static class SocketMessenger implements Runnable{
-			private Socket socket;
-			private SocketServer server;
-			private PublicKey key;
-			private PrintWriter writer;
-			private BufferedReader reader;
-			private String keyread = "";
-			private String fullmessage = "";
 			private AtomicBoolean handshaked = new AtomicBoolean(false);
-			private String name;
+			private String RSA_key = "";
+			private String AES_key = "";
+			private String message = "";
+			private Data Data = new Data();
+			private Security Security = new Security();
+			private IO IO = new IO();
+			
+			public class Data{
+				private String name;
+				private Socket socket;
+				private SocketServer server;
+			}
 
-			public SocketMessenger(SocketServer socketServer, final Socket socket){
-				this.socket = socket;
-				this.server = socketServer;
-				if(server.isEnabled() && socket.isConnected() && !socket.isClosed()){
+			public class Security{
+				private int level; // 0 = no security; 1 = AES encryption (b64 key sent); 2 = AES encryption, RSA handshake (RSA used for sending AES key)
+				private Target Target = new Target();
+				private Self Self = new Self();
+				
+				private class Target{
+					private PublicKey RSA;
+					private SecretKey AES;
+				}
+				private class Self {
+					private KeyPair RSA;
+					private SecretKey AES;
+				}
+				public void reset(){
+					Target.AES = null;
+					Target.RSA = null;
+					Self.AES = Utils.AES.generateKey();
+					Self.RSA = Utils.RSA.generateKeys();
+				}
+			}
+			
+			public class IO{
+				private BufferedReader reader;
+				private PrintWriter writer;
+				public void set(Socket socket) throws IOException{
+					reader = new BufferedReader(new InputStreamReader(socket.getInputStream()));
+					writer = new PrintWriter(socket.getOutputStream());
+				}
+			}
+			
+			public SocketMessenger(SocketServer socketServer, final Socket socket, int security){
+				Data.socket = socket;
+				Data.server = socketServer;
+				Security.level = security; // Setting security level
+				Security.reset(); // Reset security data
+				if(Data.server.isEnabled() && isConnectedAndOpened()){
 					try {
-						reader = new BufferedReader(new InputStreamReader(socket.getInputStream()));
-						writer = new PrintWriter(socket.getOutputStream());
-						try {
-							writer.println(SocketAPI.RSA.savePublicKey(server.keys.getPublic()));
-							writer.println("--end--");
-							writer.flush();
-						} catch (GeneralSecurityException e) {
-							e.printStackTrace();
+						IO.set(socket);
+						if(Security.level == 0){
+							writeJSON("SocketAPI", "handshake");
 						}
-					} catch (IOException e) {}
+						if(Security.level == 1){
+							Data.server.Data.app.log("Self AES: "+Utils.AES.toString(Security.Self.AES));
+							IO.writer.println(Utils.AES.toString(Security.Self.AES));
+							IO.writer.println("--end--");
+							IO.writer.flush();
+						}
+						if(Security.level == 2){
+							IO.writer.println(Utils.RSA.savePublicKey(Security.Self.RSA.getPublic()));
+							IO.writer.println("--end--");
+							IO.writer.flush();
+						}
+					} catch (Exception e) {
+					}
 				}
 			}
 			
 			@Override
 			public void run() {
-				while(server.isEnabled() && socket.isConnected() && !socket.isClosed()){
+				while(Data.server.isEnabled() && isConnectedAndOpened()){ // While connected
 					try {
-						String read = reader.readLine();
-						if(read == null) close(); else {
-							if(key == null){
-								if(!read.equals("--end--")) keyread += read; else {
-									try {
-										key = SocketAPI.RSA.loadPublicKey(keyread);
-										writeJSON("SocketAPI", "handshake");
-									} catch (GeneralSecurityException e) {
-										e.printStackTrace();
+						String read = IO.reader.readLine();
+						if(read == null) close(); // If end of stream, close
+						else {
+							if(Security.level >= 2 && Security.Target.RSA == null){ // Is RSA enabled? Do we received the RSA key?
+								
+								if(!read.equals("--end--")) RSA_key += read; // Is the message fully received?
+								
+								else { // Yay, we received the RSA key
+									Security.Target.RSA = Utils.RSA.loadPublicKey(RSA_key); // Convert it to a PublicKey object
+									// Now we send our AES key encrypted with RSA
+									IO.writer.println(Utils.RSA.encrypt(Utils.AES.toString(Security.Self.AES), Security.Target.RSA));
+									IO.writer.println("--end--");
+									IO.writer.flush();
+								}
+							} else if(Security.level >= 1 && Security.Target.AES == null){
+								
+								if(!read.equals("--end--")) AES_key += read;
+								
+								else {
+									if(Security.level == 1){
+										Data.server.Data.app.log("Target AES: "+AES_key);
+										Security.Target.AES = Utils.AES.toKey(AES_key);
 									}
+									if(Security.level == 2){
+										Security.Target.AES = Utils.AES.toKey(Utils.RSA.decrypt(AES_key, Security.Self.RSA.getPrivate()));
+									}
+									writeJSON("SocketAPI", "handshake");
 								}
 							} else {
-								String message = SocketAPI.RSA.decrypt(read, server.keys.getPrivate());
-								if(message != null && !message.isEmpty()){
-									if(!message.equals("--end--")) fullmessage += message; else {
-										if(fullmessage != null && !fullmessage.isEmpty()){
+								String decrypted = "";
+								if(Security.level == 0) decrypted = read;
+								if(Security.level >= 1) decrypted = Utils.AES.decrypt(read, Security.Self.AES);
+								Data.server.Data.app.log("<- "+read);
+								Data.server.Data.app.log("<- ("+decrypted+")");
+								if(decrypted != null && !decrypted.isEmpty()){
+									
+									if(!decrypted.equals("--end--")) message += decrypted;
+									
+									else {
+										if(message != null && !message.isEmpty()){
 											try{
 												@SuppressWarnings("unchecked")
-												Map<String, String> map = SocketAPI.gson().fromJson(fullmessage, Map.class);
-												if(map.get("channel").equals("SocketAPI")){
+												Map<String, String> map = SocketAPI.gson().fromJson(message, Map.class);
+												if(map.get("channel").equals("SocketAPI")){ // Is it our channel?
 													if(map.get("data").equals("handshake")){
 														handshaked.set(true);
-														name = map.get("name");
-														server.getApp().onHandshake(this, name);
+														Data.name = map.get("name");
+														Data.server.getApp().onHandshake(this, Data.name);
 														writeJSON("SocketAPI", "handshaked");
 													}
-												} else server.getApp().onJSON(this, map);
+												}
+												else Data.server.getApp().onJSON(this, map);
 											} catch (JsonSyntaxException e){}
-										} fullmessage = "";
+										}
+										message = "";
 									}
 								}
 							}
 						}
-					} catch (IOException e) {
+					} catch (Exception e) {
 						if(e.getClass().getSimpleName().equals("SocketException")) close();
 					}
 				}
 			}
 			
 			public SocketServer getServer(){
-				return server;
+				return Data.server;
 			}
 			
 			public boolean isConnectedAndOpened(){
@@ -216,34 +294,46 @@ public class SocketAPI {
 			}
 			
 			public String getName() {
-				return name;
+				return Data.name;
 			}
 
 			public void writeJSON(String channel, String data){
 				try{
 					HashMap<String, String> hashmap = new HashMap<>();
+					hashmap.put("name", Data.server.Data.name);
 					hashmap.put("channel", channel);
 					hashmap.put("data", data);
 					String json = SocketAPI.gson().toJson(hashmap);
 					write(json);
-				} catch(NullPointerException e){}
+				} catch(NullPointerException e){
+				}
 			}
 			
 			private void write(String data){
 				try{
-					String[] split = SocketAPI.split(data, 20);
-					for(String str:split) writer.println(SocketAPI.RSA.encrypt(str, key));
-					writer.println(SocketAPI.RSA.encrypt("--end--", key));
-					writer.flush();
+					String[] split = Utils.split(data, 20);
+					if(Security.level == 0){
+						for(String str:split) IO.writer.println(str);
+						IO.writer.println("--end--");
+					}
+					if(Security.level >= 1){
+						for(String str:split){
+							Data.server.Data.app.log("-> "+Utils.AES.encrypt(str, Security.Target.AES));
+							IO.writer.println(Utils.AES.encrypt(str, Security.Target.AES));
+						}
+						Data.server.Data.app.log("-> "+Utils.AES.encrypt("--end--", Security.Target.AES));
+						IO.writer.println(Utils.AES.encrypt("--end--", Security.Target.AES));
+					}
+					IO.writer.flush();
 				} catch(NullPointerException e){}
 			}
 			
 			public IOException close() {
-				if(!socket.isClosed()){
+				if(!Data.socket.isClosed()){
 					try {
-						socket.close();
-						server.messengers.remove(this);
-						server.getApp().onDisconnect(this);
+						Data.socket.close();
+						Data.server.Data.messengers.remove(this);
+						Data.server.getApp().onDisconnect(this);
 					} catch (IOException e) {
 						return e;
 					}
@@ -251,13 +341,14 @@ public class SocketAPI {
 			}
 
 			public Socket getSocket(){
-				return socket;
+				return Data.socket;
 			}
 		}
 	}
 	
 	public static class Client{
 		public static interface SocketClientApp{
+			public void log(String err);
 			public void onConnect(SocketClient client);
 			public void onDisconnect(SocketClient client);
 			public void onHandshake(SocketClient client);
@@ -265,113 +356,171 @@ public class SocketAPI {
 		}
 		
 		public static class SocketClient implements Runnable {
-			private String host;
-			private int port;
-			private Socket socket;
-			private AtomicBoolean enabled = new AtomicBoolean(true);
-			private PublicKey key;
-			private BufferedReader reader;
-			private PrintWriter writer;
-			private KeyPair keys;
-			private AtomicBoolean handshaked = new AtomicBoolean(false);
-			private SocketClientApp app;
-			private String name;
+			private boolean enabled = true;
+			private boolean handshaked = false;
+			private Data Data = new Data();
+			private Security Security = new Security();
+			private IO IO = new IO();
 			
-			public SocketClient(SocketClientApp app, String name, String host, int port, KeyPair keys){
-				this.host = host;
-				this.port = port;
-				this.keys = keys;
-				this.app = app;
-				this.name = name;
-				enabled.set(true);
-				socket = new Socket();
+			public class Data{
+				private String name;
+				private String host;
+				private int port;
+				private Socket socket;
+				private SocketClientApp app;
+				
+				public void set(String name, String host, int port, Socket socket, SocketClientApp app) {
+					Data.name = name;
+					Data.host = host;
+					Data.port = port;
+					Data.socket = socket;
+					Data.app = app;
+				}
+			}
+			
+			public class IO{
+				private BufferedReader reader;
+				private PrintWriter writer;
+				public void set(Socket socket) throws IOException{
+					reader = new BufferedReader(new InputStreamReader(socket.getInputStream()));
+					writer = new PrintWriter(socket.getOutputStream());
+				}
+			}
+			
+			public class Security{
+				private int level; // 0 = no security; 1 = AES encryption (b64 key sent); 2 = AES encryption, RSA handshake (RSA used for sending AES key)
+				private Target Target = new Target();
+				private Self Self = new Self();
+				
+				private class Target{
+					private PublicKey RSA;
+					private SecretKey AES;
+				}
+				private class Self {
+					private KeyPair RSA;
+					private SecretKey AES;
+				}
+				public void reset(){
+					Target.AES = null;
+					Target.RSA = null;
+					Self.AES = Utils.AES.generateKey();
+					Self.RSA = Utils.RSA.generateKeys();
+				}
+			}
+			
+			public SocketClient(SocketClientApp app, String name, String host, int port, int security){
+				Data.set(name, host, port, new Socket(), app);
+				Security.level = security;
+				enabled = true;
 			}
 			
 			public void run() {
-				while(enabled.get()){
+				while(enabled){
 					try {
-						socket = new Socket(host, port);
-						socket.setTcpNoDelay(true);
-						app.onConnect(this);
+						Data.socket = new Socket(Data.host, Data.port); // Connection
+						Data.socket.setTcpNoDelay(true); // Socket option
 						
-						key = null;
-						handshaked.set(false);
-						String keyread = "";
-						String fullmessage = "";
-						reader = new BufferedReader(new InputStreamReader(socket.getInputStream()));
-						writer = new PrintWriter(socket.getOutputStream());
-						while(enabled.get() && socket.isConnected() && !socket.isClosed()){
-							String read = reader.readLine();
-							if(read == null) close(); else {
-								if(key == null){
-									if(!read.equals("--end--")) keyread += read; else {
-										try {
-											key = SocketAPI.RSA.loadPublicKey(keyread);
-											writer.println(SocketAPI.RSA.savePublicKey(keys.getPublic()));
-											writer.println("--end--");
-											writer.flush();
-										} catch (GeneralSecurityException e) {
-											e.printStackTrace();
+						Data.app.onConnect(this); // Trigger onConnect event
+						Security.reset(); // Reset security data
+						IO.set(Data.socket); // Open socket streams
+						handshaked = false; // Default not handshaked
+						
+						String RSA_key = "";
+						String AES_key = "";
+						String message = "";
+						while(enabled && isConnectedAndOpened()){
+							String read = IO.reader.readLine();
+							if(read == null) close(); // If end of stream, close it
+							
+							else { // This isn't the end of stream, continue
+								
+								if(Security.level >= 2 && Security.Target.RSA == null){ // Is RSA encryption enabled? Do we have received the RSA key?
+									
+									if(!read.equals("--end--")) RSA_key += read; // The message is not fully received, continue
+									
+									else { // Yay, we received the full message, convert it to PublicKey object
+										Security.Target.RSA = Utils.RSA.loadPublicKey(RSA_key); // Done
+										
+										// Now we need to send our RSA key
+										IO.writer.println(Utils.RSA.savePublicKey(Security.Self.RSA.getPublic()));
+										IO.writer.println("--end--");
+										IO.writer.flush();
+									}
+								
+								} else if(Security.level >= 1 && Security.Target.AES == null){
+									
+									if(!read.equals("--end--")) AES_key += read;
+									
+									else{
+										if(Security.level == 1){
+											Data.app.log("Target AES: "+AES_key);
+											Security.Target.AES = Utils.AES.toKey(AES_key);
+											Data.app.log("Self AES: "+Utils.AES.toString(Security.Self.AES));
+											IO.writer.println(Utils.AES.toString(Security.Self.AES));
+											IO.writer.println("--end--");
+											IO.writer.flush();
+										}
+										if(Security.level == 2){
+											Security.Target.AES = Utils.AES.toKey(Utils.RSA.decrypt(AES_key, Security.Self.RSA.getPrivate()));
+											IO.writer.println(Utils.RSA.encrypt(Utils.AES.toString(Security.Self.AES), Security.Target.RSA));
+											IO.writer.println("--end--");
+											IO.writer.flush();
 										}
 									}
-								} else{
-									String message = SocketAPI.RSA.decrypt(read, keys.getPrivate());
-									if(message != null && !message.isEmpty()){
-										if(!message.equals("--end--")) fullmessage += message; else {
-											if(fullmessage != null && !fullmessage.isEmpty()){ 
+									
+								} else{ // We have received the RSA key
+									String decrypted = "";
+									if(Security.level == 0) decrypted = read;
+									if(Security.level >= 1) decrypted = Utils.AES.decrypt(read, Security.Self.AES);
+									Data.app.log("<- "+read);
+									Data.app.log("<- ("+decrypted+")");
+									if(decrypted != null && !decrypted.isEmpty()){
+										if(!decrypted.equals("--end--")) message += decrypted;
+										else {
+											if(message != null && !message.isEmpty()){ 
 												try{
 													@SuppressWarnings("unchecked")
-													Map<String, String> map = SocketAPI.gson().fromJson(fullmessage, Map.class);
+													Map<String, String> map = SocketAPI.gson().fromJson(message, Map.class);
 													if(map.get("channel").equals("SocketAPI")){
 														if(map.get("data").equals("handshake")){
-															handshake();
+															writeJSON("SocketAPI", "handshake");
 														} else if(map.get("data").equals("handshaked")){
-															handshaked.set(true);
-															app.onHandshake(this);
+															handshaked = true;
+															Data.app.onHandshake(this);
 														}
-													} else app.onJSON(this, map);
+													} else Data.app.onJSON(this, map);
 												} catch (JsonSyntaxException e){}
-											} fullmessage = "";
+											}
+											message = "";
 										}
 									}
 								}
 							}
 						}
-					} catch (IOException e) {
+					} catch (Exception e) {
 						if(e.getClass().getSimpleName().equals("SocketException")) close();
 					}
 				}
 			}
 
 			public int getPort(){
-				return port;
+				return Data.port;
 			}
 			
 			public String getHost(){
-				return host;
+				return Data.host;
 			}
 			
 			public Socket getSocket(){
-				return socket;
+				return Data.socket;
 			}
 			
 			public boolean isConnectedAndOpened(){
-				return socket.isConnected() && !socket.isClosed();
+				return Data.socket.isConnected() && !Data.socket.isClosed();
 			}
 			
 			public boolean isHandshaked() {
-				return handshaked.get();
-			}
-			
-			private void handshake(){
-				try{
-					HashMap<String, String> hashmap = new HashMap<>();
-					hashmap.put("channel", "SocketAPI");
-					hashmap.put("data", "handshake");
-					hashmap.put("name", name);
-					String json = SocketAPI.gson().toJson(hashmap);
-					write(json);
-				} catch(NullPointerException e){}
+				return handshaked;
 			}
 
 			public void writeJSON(String channel, String data){
@@ -379,6 +528,7 @@ public class SocketAPI {
 					HashMap<String, String> hashmap = new HashMap<>();
 					hashmap.put("channel", channel);
 					hashmap.put("data", data);
+					hashmap.put("name", Data.name);
 					String json = SocketAPI.gson().toJson(hashmap);
 					write(json);
 				} catch(NullPointerException e){}
@@ -386,18 +536,28 @@ public class SocketAPI {
 			
 			private void write(String data){
 				try{
-					String[] split = SocketAPI.split(data, 20);
-					for(String str:split) writer.println(SocketAPI.RSA.encrypt(str, key));
-					writer.println(SocketAPI.RSA.encrypt("--end--", key));
-					writer.flush();
+					String[] split = Utils.split(data, 20);
+					if(Security.level == 0){
+						for(String str:split) IO.writer.println(str);
+						IO.writer.println("--end--");
+					}
+					if(Security.level >= 1){
+						for(String str:split){
+							Data.app.log("-> "+Utils.AES.encrypt(str, Security.Target.AES));
+							IO.writer.println(Utils.AES.encrypt(str, Security.Target.AES));
+						}
+						Data.app.log("-> "+Utils.AES.encrypt("--end--", Security.Target.AES));
+						IO.writer.println(Utils.AES.encrypt("--end--", Security.Target.AES));
+					}
+					IO.writer.flush();
 				} catch(NullPointerException e){}
 			}
 			
 			public IOException close(){
-				if(!socket.isClosed()){
+				if(!Data.socket.isClosed()){
 					try {
-						socket.close();
-						app.onDisconnect(this);
+						Data.socket.close();
+						Data.app.onDisconnect(this);
 					} catch (IOException e) {
 						return e;
 					}
@@ -405,122 +565,136 @@ public class SocketAPI {
 			}
 			
 			public IOException interrupt(){
-				enabled.set(false);
+				enabled = false;
 				return close();
 			}
 			
 			public boolean isEnabled(){
-				return enabled.get();
+				return enabled;
 			}
 		}
 	}
 	
-	public static String encrypt(String data, String pass){
-		try{
-			while(pass.length() < 24) pass += pass;
-            SecretKeyFactory factory = SecretKeyFactory.getInstance("DESede");
-            SecretKey key = factory.generateSecret(new DESedeKeySpec(pass.getBytes()));
-            Cipher cipher = Cipher.getInstance("DESede");
-            cipher.init(Cipher.ENCRYPT_MODE, key);
-            String str = DatatypeConverter.printBase64Binary(cipher.doFinal(data.getBytes()));
-            return str;
-        } catch(Exception e) {
-        	e.printStackTrace();
-        } return null;
-	}
-	
-	
-	public static String decrypt(String data, String pass){
-		try{
-			while(pass.length() < 24) pass += pass;
-			SecretKeyFactory factory = SecretKeyFactory.getInstance("DESede");
-	        SecretKey key = factory.generateSecret(new DESedeKeySpec(pass.getBytes()));
-	        Cipher cipher = Cipher.getInstance("DESede");
-			cipher.init(Cipher.DECRYPT_MODE, key);
-	        String str = new String(cipher.doFinal(DatatypeConverter.parseBase64Binary(data)));
-	        return str;
-		} catch(Exception e){}
-		return null;
-	}
-	
-	public static String[] split(String input, int max){
-	    return input.split("(?<=\\G.{"+max+"})");
-	}
-	
-	public static class RSA {
-		public static KeyPair generateKeys(){
-			try {
-				KeyPairGenerator generator = KeyPairGenerator.getInstance("RSA");
-				KeyPair keys = generator.generateKeyPair();
-				return keys;
-			} catch (NoSuchAlgorithmException e) {
-				e.printStackTrace();
-			} return null;
+	public static class Utils{
+		public static class B64{
+			public static String to(byte[] data){
+				return Base64.getEncoder().encodeToString(data);
+			}
+			
+			public static byte[] from(String data){
+				return Base64.getDecoder().decode(data);
+			}
 		}
 		
-		public static String encrypt(String data, PublicKey key){
-			try {
-				Cipher rsa = Cipher.getInstance("RSA");
-				rsa.init(Cipher.ENCRYPT_MODE, key); 
-				return DatatypeConverter.printBase64Binary(rsa.doFinal(data.getBytes()));
-			} catch (NoSuchAlgorithmException | NoSuchPaddingException | IllegalBlockSizeException | BadPaddingException e) {
-				e.printStackTrace();
-			} catch (InvalidKeyException e) {}
-			return null;
+		public static class AES {
+			
+			public static SecretKey generateKey(){
+				try {
+					KeyGenerator KeyGen = KeyGenerator.getInstance("AES");
+					KeyGen.init(128);
+					return KeyGen.generateKey();
+				} catch (NoSuchAlgorithmException e) {
+				} return null;
+			}
+			
+			public static String encrypt(String data, SecretKey key){
+				String str = null;
+				try{
+			        Cipher AesCipher = Cipher.getInstance("AES");
+			        AesCipher.init(Cipher.ENCRYPT_MODE, key);
+		            str = B64.to(AesCipher.doFinal(data.getBytes()));
+		        } catch(Exception e) {
+		        } return str;
+			}
+			
+			
+			public static String decrypt(String data, SecretKey key){
+				String str = null;
+				try{
+					Cipher AesCipher = Cipher.getInstance("AES");
+					AesCipher.init(Cipher.DECRYPT_MODE, key);
+			        byte[] bytePlainText = AesCipher.doFinal(B64.from(data));
+			        str = new String(bytePlainText);
+				} catch(Exception e){}
+				return str;
+			}
+			
+			public static SecretKey toKey(String key){
+				byte[] decodedKey = B64.from(key);
+				return new SecretKeySpec(decodedKey, 0, decodedKey.length, "AES"); 
+			}
+			
+			public static String toString(SecretKey key){
+				return B64.to(key.getEncoded());
+			}
 		}
 		
-		public static String decrypt(String data, PrivateKey key){
-			try {
-				Cipher rsa = Cipher.getInstance("RSA");
-				rsa.init(Cipher.DECRYPT_MODE, key);
-				return new String(rsa.doFinal(DatatypeConverter.parseBase64Binary(data)));
-			} catch (NoSuchAlgorithmException | NoSuchPaddingException | IllegalBlockSizeException | BadPaddingException e) {
-				e.printStackTrace();
-			} catch (InvalidKeyException e) {}
-			return null;
+		public static class RSA {
+				
+			public static KeyPair generateKeys(){
+				try {
+					KeyPairGenerator generator = KeyPairGenerator.getInstance("RSA");
+					return generator.generateKeyPair();
+				} catch (NoSuchAlgorithmException e) {
+				} return null;
+			}
+			
+			public static String encrypt(String data, PublicKey key){
+				try {
+					Cipher rsa = Cipher.getInstance("RSA");
+					rsa.init(Cipher.ENCRYPT_MODE, key); 
+					return B64.to(rsa.doFinal(data.getBytes()));
+				} catch (Exception e) {
+				} return null;
+			}
+			
+			public static String decrypt(String data, PrivateKey key){
+				try {
+					Cipher rsa = Cipher.getInstance("RSA");
+					rsa.init(Cipher.DECRYPT_MODE, key);
+					return new String(rsa.doFinal(B64.from(data)));
+				} catch (Exception e) {
+				} return null;
+			}
+			
+			public static PrivateKey loadPrivateKey(String key64) throws GeneralSecurityException, IOException {
+			    byte[] clear = B64.from(key64);
+			    PKCS8EncodedKeySpec keySpec = new PKCS8EncodedKeySpec(clear);
+			    KeyFactory fact = KeyFactory.getInstance("RSA");
+			    PrivateKey priv = fact.generatePrivate(keySpec);
+			    Arrays.fill(clear, (byte) 0);
+			    return priv;
+			}
+	
+			public static PublicKey loadPublicKey(String key64) throws GeneralSecurityException, IOException {
+			    byte[] data = B64.from(key64);
+			    X509EncodedKeySpec spec = new X509EncodedKeySpec(data);
+			    KeyFactory fact = KeyFactory.getInstance("RSA");
+			    return fact.generatePublic(spec);
+			}
+	
+			public static String savePrivateKey(PrivateKey priv) throws GeneralSecurityException {
+			    KeyFactory fact = KeyFactory.getInstance("RSA");
+			    PKCS8EncodedKeySpec spec = fact.getKeySpec(priv, PKCS8EncodedKeySpec.class);
+			    byte[] packed = spec.getEncoded();
+			    String key64 = B64.to(packed);
+			    Arrays.fill(packed, (byte) 0);
+			    return key64;
+			}
+	
+			public static String savePublicKey(PublicKey publ) throws GeneralSecurityException {
+			    KeyFactory fact = KeyFactory.getInstance("RSA");
+			    X509EncodedKeySpec spec = fact.getKeySpec(publ, X509EncodedKeySpec.class);
+			    return B64.to(spec.getEncoded());
+			}
 		}
-		
-		public static PrivateKey loadPrivateKey(String key64) throws GeneralSecurityException, IOException {
-		    byte[] clear = new BASE64Decoder().decodeBuffer(key64);
-		    PKCS8EncodedKeySpec keySpec = new PKCS8EncodedKeySpec(clear);
-		    KeyFactory fact = KeyFactory.getInstance("RSA");
-		    PrivateKey priv = fact.generatePrivate(keySpec);
-		    Arrays.fill(clear, (byte) 0);
-		    return priv;
-		}
-
-		public static PublicKey loadPublicKey(String stored) throws GeneralSecurityException, IOException {
-		    byte[] data = new BASE64Decoder().decodeBuffer(stored);
-		    X509EncodedKeySpec spec = new X509EncodedKeySpec(data);
-		    KeyFactory fact = KeyFactory.getInstance("RSA");
-		    return fact.generatePublic(spec);
-		}
-
-		public static String savePrivateKey(PrivateKey priv) throws GeneralSecurityException {
-		    KeyFactory fact = KeyFactory.getInstance("RSA");
-		    PKCS8EncodedKeySpec spec = fact.getKeySpec(priv, PKCS8EncodedKeySpec.class);
-		    byte[] packed = spec.getEncoded();
-		    String key64 = new BASE64Encoder().encode(packed);
-		    Arrays.fill(packed, (byte) 0);
-		    return key64;
-		}
-
-		public static String savePublicKey(PublicKey publ) throws GeneralSecurityException {
-		    KeyFactory fact = KeyFactory.getInstance("RSA");
-		    X509EncodedKeySpec spec = fact.getKeySpec(publ, X509EncodedKeySpec.class);
-		    return new BASE64Encoder().encode(spec.getEncoded());
+	
+		public static String[] split(String input, int max){
+		    return input.split("(?<=\\G.{"+max+"})");
 		}
 	}
 	
 	public static SocketAPI instance(){
 		return new SocketAPI();
-	}
-	
-	public static Bungee bungee(){
-		return Bungee.instance();
-	}
-	
-	public static Bukkit bukkit(){
-		return Bukkit.instance();
 	}
 }
