@@ -113,6 +113,18 @@ public class SocketAPI {
 			public ServerSocket getServerSocket() {
 				return Data.server;
 			}
+			
+			public int getSecurityLevel() {
+				return Data.security;
+			}
+			
+			public String getName() {
+				return Data.name;
+			}
+			
+			public ArrayList<SocketMessenger> getMessengers(){
+				return Data.messengers;
+			}
 
 			@Override
 			public void run() {
@@ -564,6 +576,14 @@ public class SocketAPI {
 
 			public Socket getSocket() {
 				return Data.socket;
+			}
+			
+			public String getName() {
+				return Data.name;
+			}
+			
+			public int getSecurityLevel() {
+				return Security.level;
 			}
 
 			public boolean isConnectedAndOpened() {
